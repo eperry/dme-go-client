@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"4d63.com/tz"
@@ -27,7 +29,14 @@ type Client struct {
 	secretKey  string //Required
 	insecure   bool   //Optional
 	proxyurl   string //Optional
+
+	requestLimit      int
+	requestsRemaining int
 }
+
+const sleepMultiplier = 2.0
+const minSleep = 3
+const maxSleep = 300
 
 //singleton implementation of a client
 var clietnImpl *Client
@@ -44,6 +53,117 @@ func ProxyUrl(pUrl string) Option {
 	return func(client *Client) {
 		client.proxyurl = pUrl
 	}
+}
+
+func isRateLimitError(resp *http.Response) bool {
+
+	if resp.StatusCode == 400 || resp.StatusCode == 429 {
+		if header, exists := resp.Header["X-Dnsme-Requestsremaining"]; exists {
+			if len(header) < 1 {
+				return false
+			}
+
+			limString := header[0]
+			limInt, err := strconv.Atoi(limString)
+
+			if nil != err {
+				log.Printf("Error getting requests remaining: %s", err)
+				return false
+			}
+
+			log.Printf("HTTP Status %d, Requests Remaining: %d", resp.StatusCode, limInt)
+			return limInt <= 0
+		}
+	}
+
+	return false
+}
+
+func (c *Client) updateRateLimits(resp *http.Response) {
+	log.Println("Updating Request Limits", resp.Header)
+
+	if limit, exists := resp.Header["X-Dnsme-Requestlimit"]; exists {
+		lim, err := strconv.Atoi(limit[0])
+
+		if err == nil {
+			log.Printf("Updating DNSME Rate Limit, request limit: %d \n", lim)
+			c.requestLimit = lim
+		} else {
+			log.Println("Couldnt update request limit, %s", err)
+		}
+	} else {
+		log.Println("Request limit header not available")
+	}
+
+	if limit, exists := resp.Header["X-Dnsme-Requestsremaining"]; exists {
+		lim, err := strconv.Atoi(limit[0])
+
+		if err == nil {
+			log.Printf("Updating DNSME Rate Limit, %d requests remaining\n", lim)
+			c.requestsRemaining = lim
+		} else {
+			log.Println("Couldnt update requests remaining, %s", err)
+		}
+	} else {
+		log.Println("Requests remaining header not available")
+	}
+}
+
+func (c *Client) rateLimitRequest(req *http.Request) (*http.Response, error) {
+	if c.requestsRemaining == 0 || (float64(c.requestsRemaining)/float64(c.requestLimit)) < 0.2 {
+		log.Println("We're at the rate limit -- wait a preliminary 2 seconds to try and get through it.")
+		time.Sleep(minSleep * time.Second)
+	}
+
+	return c.doHTTPRequest(req, 0)
+}
+
+func (c *Client) retryRateLimitRequest(req *http.Request, retryCount int) (*http.Response, error) {
+	sleepTime := time.Duration(minSleep * int64(math.Pow(sleepMultiplier, float64(retryCount))))
+	sleepTime = time.Duration((math.Min(float64(sleepTime), float64(maxSleep))))
+	log.Printf("Hit rate limit. Sleeping to back off, %s seconds (retry count %d)\n", sleepTime, retryCount)
+
+	time.Sleep(sleepTime * time.Second)
+	return c.doHTTPRequest(req, retryCount)
+}
+
+func (c *Client) doHTTPRequest(req *http.Request, retryCount int) (*http.Response, error) {
+	log.Println("In new doHTTPRequest method", req)
+
+	// have to regenerate hmac in some cases -- so we're just gonna do that right here.
+	hmac := getToken(c.apiKey, c.secretKey)
+	loc, _ := tz.LoadLocation("GMT")
+	now := time.Now().In(loc)
+	time := now.Format("Mon, 2 Jan 2006 15:04:05 MST")
+
+	req.Header.Set("x-dnsme-hmac", hmac)
+	req.Header.Set("x-dnsme-requestDate", time)
+
+	resp, err := c.httpclient.Do(req)
+	c.updateRateLimits(resp)
+	log.Println("In doHTTPRequest, resp", resp)
+
+	if nil != err {
+		return nil, err
+	}
+
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+
+	if nil != err {
+		log.Printf("In doHTTPRequest, can't read response body: %s", err)
+		return nil, err
+	}
+
+	// re-populate the body ReadCloser byte buffer so we can read it again later
+	resp.Body = ioutil.NopCloser(bytes.NewReader(bodyBytes))
+
+	log.Printf("In doHTTPReqest, response body:\n%s\n\n", string(bodyBytes))
+
+	if isRateLimitError(resp) {
+		return c.retryRateLimitRequest(req, retryCount+1)
+	}
+
+	return resp, nil
 }
 
 func initClient(apiKey, secretKey string, options ...Option) *Client {
@@ -117,7 +237,7 @@ func (c *Client) Save(obj models.Model, endpoint string) (*container.Container, 
 	}
 	log.Println("Request made : ", req)
 
-	resp, err := c.httpclient.Do(req)
+	resp, err := c.rateLimitRequest(req)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +266,7 @@ func (c *Client) GetbyId(endpoint string) (*container.Container, error) {
 	}
 	log.Println("Request for get : ", req)
 
-	resp, err1 := c.httpclient.Do(req)
+	resp, err1 := c.rateLimitRequest(req)
 	if err1 != nil {
 		return nil, err1
 	}
@@ -179,7 +299,7 @@ func (c *Client) Update(obj models.Model, endpoint string) (*container.Container
 		return nil, err
 	}
 
-	resp, err := c.httpclient.Do(req)
+	resp, err := c.rateLimitRequest(req)
 	if err != nil {
 		return nil, err
 	}
@@ -214,7 +334,7 @@ func (c *Client) Delete(endpoint string) error {
 		return err
 	}
 
-	resp, err := c.httpclient.Do(req)
+	resp, err := c.rateLimitRequest(req)
 	if err != nil {
 		return err
 	}
